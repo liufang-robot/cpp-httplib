@@ -76,3 +76,13 @@ request targets, restart, SIGPIPE policy, and default/no-exceptions compatibilit
 The POSIX listener test deliberately reuses the exact closed descriptor for an
 unrelated socket pair. Raw-target tests prove origin-server byte preservation;
 browser and reverse-proxy name normalization remains an integration concern.
+# Exact request routing
+
+`CPPHTTPLIB_SERVER_RAW_ROUTING` preserves `Request::target` exactly, including
+literal `#` bytes that an application router may reject. It also admits any
+syntactically valid HTTP method token to pre-routing, so the application can
+return a resource-specific 405/Allow response for extension methods. Invalid
+method tokens remain parsing failures. Enable this consistently in translation
+units using the header; it changes inline server behavior, not object layout.
+`CPPHTTPLIB_RAW_ROUTING_SUPPORT=1` advertises the opt-in capability. Default
+fragment/method behavior remains unchanged when the option is absent.
