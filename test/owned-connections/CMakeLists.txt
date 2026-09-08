@@ -40,7 +40,8 @@ foreach(case IN ITEMS queue_http queue_tls interrupted_http interrupted_tls
     reject_http reject_tls discarded_http discarded_tls hook_exception
     request_exception restart_http restart_tls raw_target signal_policy
     listener_ownership start_exception queue_exception configuration_failures
-    grace_http grace_tls held_http held_tls bind_callback_failure wait_cancellation)
+    grace_http grace_tls held_http held_tls bind_callback_failure wait_cancellation
+    idle_tls_shutdown)
   add_test(NAME owned_${case} COMMAND owned_connections_test ${case})
   set_tests_properties(owned_${case} PROPERTIES TIMEOUT 15)
 endforeach()
