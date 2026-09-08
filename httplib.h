@@ -18303,14 +18303,32 @@ inline bool SSLServer::process_and_close_socket(socket_t sock) {
   bool websocket_upgraded = false;
   struct SessionCleanup {
     session_t session;
+    socket_t sock;
     bool &handshake_done;
     bool &ret;
     bool &websocket_upgraded;
     ~SessionCleanup() {
-      if (handshake_done) { shutdown(session, !websocket_upgraded && ret); }
+      bool can_shutdown = handshake_done;
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
+      // TLS close_notify must not enter a blocking backend read/write which
+      // bypasses the worker's cancellation-aware readiness waits. Send it on
+      // a best-effort nonblocking basis; the connection task still owns final
+      // socket close after free_session. Default server behavior is unchanged.
+      if (can_shutdown) {
+#ifdef _WIN32
+        u_long nonblocking = 1;
+        can_shutdown = ioctlsocket(sock, FIONBIO, &nonblocking) == 0;
+#else
+        const auto flags = fcntl(sock, F_GETFL, 0);
+        can_shutdown = flags != -1 &&
+                       fcntl(sock, F_SETFL, flags | O_NONBLOCK) != -1;
+#endif
+      }
+#endif
+      if (can_shutdown) { shutdown(session, !websocket_upgraded && ret); }
       free_session(session);
     }
-  } cleanup{session, handshake_done, ret, websocket_upgraded};
+  } cleanup{session, sock, handshake_done, ret, websocket_upgraded};
 
   // Perform TLS accept handshake with timeout
   TlsError tls_err;

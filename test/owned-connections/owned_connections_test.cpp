@@ -581,6 +581,29 @@ void active_response(bool tls, bool broken_peer, bool interrupt) {
   }
 }
 
+void idle_tls_shutdown() {
+  RunningServer runtime(true);
+  httplib::Client client("https://127.0.0.1:" + std::to_string(runtime.port));
+  client.set_ca_cert_path("test.crt");
+  client.set_keep_alive(true);
+  auto response = client.Get("/idle");
+  check(response && response->status == 200, "establish TLS keep-alive");
+  auto connection = runtime.connections.at(0);
+  // The HTTP exchange completed, but this idle client will not read or reply
+  // to TLS close_notify. Stopping admission must not trap the worker in the
+  // TLS backend's blocking shutdown call before cancellation can be observed.
+  runtime.server->stop();
+  const auto deadline = Clock::now() + std::chrono::seconds(2);
+  while (!connection->is_closed() && Clock::now() < deadline) {
+    std::this_thread::yield();
+  }
+  const bool closed = connection->is_closed();
+  // Always release the peer before cleanup, including on the unpatched code.
+  client.stop();
+  runtime.stop();
+  check(closed, "TLS cleanup waited for an idle peer's close_notify");
+}
+
 void signal_policy() {
 #ifndef _WIN32
   struct sigaction original {
@@ -642,6 +665,8 @@ int main(int argc, char **argv) {
       runtime.stop();
     } else if (name == "raw_target") {
       raw_target();
+    } else if (name == "idle_tls_shutdown") {
+      idle_tls_shutdown();
     } else if (name == "signal_policy") {
       signal_policy();
     } else if (name == "listener_ownership") {

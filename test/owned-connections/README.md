@@ -38,6 +38,11 @@ WSAPoll can remain blocked during a stalled TLS handshake after local shutdown.
 The flag avoids relying on that wakeup and applies only to the owned socket;
 a handler's nested client connections are unaffected.
 
+Owned server TLS cleanup sends `close_notify` on a best-effort nonblocking
+socket. Waiting for an idle peer's reply inside a blocking TLS backend call
+would bypass those cancellation checks. The worker frees TLS state before its
+connection owner closes the socket. Default server/client cleanup is unchanged.
+
 With ownership enabled, the private virtual processor is `process_socket`; it must not close
 the socket. Custom overrides of the old private `process_and_close_socket`
 need updating for an owned build. This is intentional: retaining an override that closes a raw
@@ -71,7 +76,7 @@ ctest --test-dir build-owned --output-on-failure --parallel 2
 
 The tests generate their own temporary TLS credentials in the build directory.
 They cover queued disposal, rejection, active I/O and TLS handshake interruption,
-held callbacks, graceful responses, startup exceptions, bind/TLS failures, raw
+held callbacks, graceful responses, idle TLS cleanup, startup exceptions, bind/TLS failures, raw
 request targets, restart, SIGPIPE policy, and default/no-exceptions compatibility.
 The POSIX listener test deliberately reuses the exact closed descriptor for an
 unrelated socket pair. Raw-target tests prove origin-server byte preservation;
