@@ -1913,6 +1913,40 @@ protected:
   Error error_ = Error::Success;
 };
 
+// Capability markers for applications that require owned accepted sockets and
+// opt out of modifying the process-wide SIGPIPE disposition.
+#define CPPHTTPLIB_SERVER_CONNECTION_SUPPORT 1
+#define CPPHTTPLIB_SIGPIPE_POLICY_SUPPORT 1
+#define CPPHTTPLIB_OWNED_LISTENER_SUPPORT 1
+
+class ServerConnection {
+public:
+  ~ServerConnection();
+
+  // Discard a queued connection without parsing HTTP or handshaking TLS. For
+  // an active connection, interrupt socket I/O; its worker retains final-close
+  // ownership until all use (including TLS cleanup) ends. A retained handle is
+  // safe to cancel after close, even if the OS has reused the descriptor.
+  void cancel() noexcept;
+  bool is_closed() const noexcept;
+  bool is_active() const noexcept;
+
+  ServerConnection(const ServerConnection &) = delete;
+  ServerConnection &operator=(const ServerConnection &) = delete;
+
+private:
+  friend class Server;
+  explicit ServerConnection(socket_t sock) : sock_(sock) {}
+  socket_t release() noexcept;
+  bool claim() noexcept;
+  void finish() noexcept;
+  void close_locked() noexcept;
+
+  mutable std::mutex mutex_;
+  socket_t sock_;
+  bool active_ = false;
+};
+
 class TaskQueue {
 public:
   TaskQueue() = default;
@@ -2197,6 +2231,13 @@ public:
   Server &set_ipv6_v6only(bool on);
   Server &set_socket_options(SocketOptions socket_options);
 
+  // Set before listening. Called on the listener thread before enqueue, for
+  // both HTTP and HTTPS, including connections later rejected by the queue.
+  // Retaining the handle does not keep a completed socket open. An exception
+  // closes this connection and is contained at the listener boundary.
+  Server &set_connection_handler(
+      std::function<void(std::shared_ptr<ServerConnection>)> handler);
+
   Server &set_default_headers(Headers headers);
   Server &
   set_header_writer(std::function<ssize_t(Stream &, Headers &)> const &writer);
@@ -2344,6 +2385,12 @@ private:
                                 SocketOptions socket_options) const;
   int bind_internal(const std::string &host, int port, int socket_flags);
   bool listen_internal();
+  void close_listener() noexcept;
+
+  std::mutex listener_mutex_;
+  std::unique_ptr<ServerConnection> listener_connection_;
+  bool binding_ = false;
+  bool bind_cancelled_ = false;
 
   bool routing(Request &req, Response &res, Stream &strm);
   bool handle_file_request(Request &req, Response &res);
@@ -2385,7 +2432,16 @@ private:
                          FormDataHeader multipart_header,
                          ContentReceiver multipart_receiver) const;
 
-  virtual bool process_and_close_socket(socket_t sock);
+  virtual bool process_socket(socket_t sock);
+
+  struct ConnectionTask {
+    explicit ConnectionTask(std::shared_ptr<ServerConnection> value)
+        : connection(std::move(value)) {}
+    ~ConnectionTask() { connection->finish(); }
+    std::shared_ptr<ServerConnection> connection;
+  };
+
+  std::function<void(std::shared_ptr<ServerConnection>)> connection_handler_;
 
   void output_log(const Request &req, const Response &res) const;
   void output_pre_compression_log(const Request &req,
@@ -3280,7 +3336,7 @@ public:
   int ssl_last_error() const { return last_ssl_error_; }
 
 private:
-  bool process_and_close_socket(socket_t sock) override;
+  bool process_socket(socket_t sock) override;
 
   tls::ctx_t ctx_ = nullptr;
   std::mutex ctx_mutex_;
@@ -6514,7 +6570,7 @@ inline int shutdown_socket(socket_t sock) noexcept {
 // (or bytes arriving after the receive side is closed) makes the stack send
 // an abortive RST instead of a graceful FIN, which can make the peer see the
 // response as a failed read even though it was fully written.
-inline void drain_and_close_socket(socket_t sock) noexcept {
+inline void drain_socket(socket_t sock) noexcept {
 #ifdef _WIN32
   shutdown(sock, SD_SEND);
 #else
@@ -6537,7 +6593,10 @@ inline void drain_and_close_socket(socket_t sock) noexcept {
     if (n <= 0) { break; }
     total += static_cast<size_t>(n);
   }
+}
 
+inline void drain_and_close_socket(socket_t sock) noexcept {
+  drain_socket(sock);
   shutdown_socket(sock);
   close_socket(sock);
 }
@@ -6898,6 +6957,17 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
                        int address_family, int socket_flags, bool tcp_nodelay,
                        bool ipv6_v6only, SocketOptions socket_options,
                        BindOrConnect bind_or_connect, time_t timeout_sec = 0) {
+  struct SocketGuard {
+    socket_t sock;
+    ~SocketGuard() {
+      if (sock != INVALID_SOCKET) { close_socket(sock); }
+    }
+    socket_t release() noexcept {
+      const auto value = sock;
+      sock = INVALID_SOCKET;
+      return value;
+    }
+  };
   // Get address info
   const char *node = nullptr;
   struct addrinfo hints;
@@ -6931,6 +7001,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
 #endif
 
     if (sock != INVALID_SOCKET) {
+      SocketGuard guard{sock};
       sockaddr_un addr{};
       addr.sun_family = AF_UNIX;
 
@@ -6956,10 +7027,8 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
 #endif
 
       bool dummy;
-      if (!bind_or_connect(sock, hints, dummy)) {
-        close_socket(sock);
-        sock = INVALID_SOCKET;
-      }
+      return bind_or_connect(sock, hints, dummy) ? guard.release()
+                                                 : INVALID_SOCKET;
     }
     return sock;
   }
@@ -6974,7 +7043,10 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
 #endif
     return INVALID_SOCKET;
   }
-  auto se = detail::scope_exit([&] { freeaddrinfo(result); });
+  struct AddressGuard {
+    struct addrinfo *value;
+    ~AddressGuard() { freeaddrinfo(value); }
+  } address_guard{result};
 
   for (auto rp = result; rp; rp = rp->ai_next) {
     // Create a socket
@@ -7010,12 +7082,10 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
 
 #endif
     if (sock == INVALID_SOCKET) { continue; }
+    SocketGuard guard{sock};
 
 #if !defined _WIN32 && !defined SOCK_CLOEXEC
-    if (fcntl(sock, F_SETFD, FD_CLOEXEC) == -1) {
-      close_socket(sock);
-      continue;
-    }
+    if (fcntl(sock, F_SETFD, FD_CLOEXEC) == -1) { continue; }
 #endif
 
     if (tcp_nodelay) { set_socket_opt(sock, IPPROTO_TCP, TCP_NODELAY, 1); }
@@ -7028,9 +7098,7 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
 
     // bind or connect
     auto quit = false;
-    if (bind_or_connect(sock, *rp, quit)) { return sock; }
-
-    close_socket(sock);
+    if (bind_or_connect(sock, *rp, quit)) { return guard.release(); }
 
     if (quit) { break; }
   }
@@ -12651,12 +12719,60 @@ inline void WebSocketSSLStream::set_read_timeout(time_t sec, time_t usec) {
  */
 
 // HTTP server implementation
+inline ServerConnection::~ServerConnection() { finish(); }
+
+inline void ServerConnection::close_locked() noexcept {
+  if (sock_ != INVALID_SOCKET) {
+    detail::shutdown_socket(sock_);
+    detail::close_socket(sock_);
+    sock_ = INVALID_SOCKET;
+  }
+}
+
+inline void ServerConnection::cancel() noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (sock_ == INVALID_SOCKET) { return; }
+  if (active_) {
+    detail::shutdown_socket(sock_);
+  } else {
+    close_locked();
+  }
+}
+
+inline bool ServerConnection::is_closed() const noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return sock_ == INVALID_SOCKET;
+}
+
+inline bool ServerConnection::is_active() const noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  return sock_ != INVALID_SOCKET && active_;
+}
+
+inline socket_t ServerConnection::release() noexcept {
+  const auto result = sock_;
+  sock_ = INVALID_SOCKET;
+  return result;
+}
+
+inline bool ServerConnection::claim() noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  if (sock_ == INVALID_SOCKET || active_) { return false; }
+  active_ = true;
+  return true;
+}
+
+inline void ServerConnection::finish() noexcept {
+  std::lock_guard<std::mutex> lock(mutex_);
+  close_locked();
+}
+
 inline Server::Server()
     : new_task_queue([] {
         return new ThreadPool(CPPHTTPLIB_THREAD_POOL_COUNT,
                               CPPHTTPLIB_THREAD_POOL_MAX_COUNT);
       }) {
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(CPPHTTPLIB_NO_DEFAULT_SIGPIPE)
   signal(SIGPIPE, SIG_IGN);
 #endif
 }
@@ -12933,6 +13049,12 @@ inline Server &Server::set_socket_options(SocketOptions socket_options) {
   return *this;
 }
 
+inline Server &Server::set_connection_handler(
+    std::function<void(std::shared_ptr<ServerConnection>)> handler) {
+  connection_handler_ = std::move(handler);
+  return *this;
+}
+
 inline Server &Server::set_default_headers(Headers headers) {
   default_headers_ = std::move(headers);
   return *this;
@@ -13054,15 +13176,19 @@ inline void Server::wait_until_ready() const {
 }
 
 inline void Server::stop() noexcept {
-  // Release the listening socket whether or not the accept loop is running:
-  // bind_to_port() without listen_after_bind() still owns the descriptor. The
-  // exchange is what makes this safe to call concurrently with the accept loop.
-  socket_t sock = svr_sock_.exchange(INVALID_SOCKET);
-  if (sock != INVALID_SOCKET) {
-    detail::shutdown_socket(sock);
-    detail::close_socket(sock);
-  }
+  std::lock_guard<std::mutex> lock(listener_mutex_);
+  if (binding_) { bind_cancelled_ = true; }
+  svr_sock_ = INVALID_SOCKET;
+  // A running accept loop keeps final-close ownership. Closing here would
+  // allow a descriptor it already loaded to be reused by another subsystem.
+  if (listener_connection_) { listener_connection_->cancel(); }
   is_decommissioned = false;
+}
+
+inline void Server::close_listener() noexcept {
+  std::lock_guard<std::mutex> lock(listener_mutex_);
+  svr_sock_ = INVALID_SOCKET;
+  listener_connection_.reset();
 }
 
 inline void Server::decommission() { is_decommissioned = true; }
@@ -13621,32 +13747,67 @@ Server::create_server_socket(const std::string &host, int port,
 
 inline int Server::bind_internal(const std::string &host, int port,
                                  int socket_flags) {
-  if (is_decommissioned) { return -1; }
+  {
+    std::lock_guard<std::mutex> lock(listener_mutex_);
+    if (is_running_ || binding_ || svr_sock_ != INVALID_SOCKET ||
+        is_decommissioned) {
+      return -1;
+    }
+    binding_ = true;
+    bind_cancelled_ = false;
+  }
+  // Socket-options and error callbacks run without the lifecycle lock, so
+  // they can request stop as well. A concurrent stop cancels the bind commit.
+  struct BindGuard {
+    Server &server;
+    ~BindGuard() {
+      std::lock_guard<std::mutex> lock(server.listener_mutex_);
+      server.binding_ = false;
+    }
+  } bind_guard{*this};
 
   if (!is_valid()) { return -1; }
 
-  svr_sock_ = create_server_socket(host, port, socket_flags, socket_options_);
-  if (svr_sock_ == INVALID_SOCKET) { return -1; }
+  ServerConnection bound(
+      create_server_socket(host, port, socket_flags, socket_options_));
+  if (bound.sock_ == INVALID_SOCKET) { return -1; }
+
+  // Bounded readiness polling plus nonblocking accept also permits stop on
+  // platforms where shutdown of a listening socket does not wake accept.
+#ifdef _WIN32
+  u_long nonblocking = 1;
+  if (ioctlsocket(bound.sock_, FIONBIO, &nonblocking)) { return -1; }
+#else
+  const auto flags = fcntl(bound.sock_, F_GETFL, 0);
+  if (flags == -1 || fcntl(bound.sock_, F_SETFL, flags | O_NONBLOCK) == -1) {
+    return -1;
+  }
+#endif
 
   if (port == 0) {
     struct sockaddr_storage addr;
     socklen_t addr_len = sizeof(addr);
-    if (getsockname(svr_sock_, reinterpret_cast<struct sockaddr *>(&addr),
+    if (getsockname(bound.sock_, reinterpret_cast<struct sockaddr *>(&addr),
                     &addr_len) == -1) {
       output_error_log(Error::GetSockName, nullptr);
       return -1;
     }
     if (addr.ss_family == AF_INET) {
-      return ntohs(reinterpret_cast<struct sockaddr_in *>(&addr)->sin_port);
+      port = ntohs(reinterpret_cast<struct sockaddr_in *>(&addr)->sin_port);
     } else if (addr.ss_family == AF_INET6) {
-      return ntohs(reinterpret_cast<struct sockaddr_in6 *>(&addr)->sin6_port);
+      port = ntohs(reinterpret_cast<struct sockaddr_in6 *>(&addr)->sin6_port);
     } else {
       output_error_log(Error::UnsupportedAddressFamily, nullptr);
       return -1;
     }
-  } else {
-    return port;
   }
+  {
+    std::lock_guard<std::mutex> lock(listener_mutex_);
+    if (bind_cancelled_) { return -1; }
+    listener_connection_.reset(new ServerConnection(bound.release()));
+    svr_sock_ = listener_connection_->sock_;
+  }
+  return port;
 }
 
 inline bool Server::listen_internal() {
@@ -13654,42 +13815,73 @@ inline bool Server::listen_internal() {
   // failure instead of returning success without ever serving, and mark the
   // server decommissioned the way any failed listen does so that a concurrent
   // wait_until_ready() wakes up instead of spinning forever.
-  if (is_decommissioned || svr_sock_ == INVALID_SOCKET) {
-    is_decommissioned = true;
-    return false;
+  socket_t listen_sock;
+  {
+    std::lock_guard<std::mutex> lock(listener_mutex_);
+    if (is_running_) { return false; }
+    if (is_decommissioned || svr_sock_ == INVALID_SOCKET ||
+        !listener_connection_ || !listener_connection_->claim()) {
+      is_decommissioned = true;
+      return false;
+    }
+    listen_sock = svr_sock_;
+    is_running_ = true;
   }
 
-  auto ret = true;
-  is_running_ = true;
-  auto se = detail::scope_exit([&]() { is_running_ = false; });
+  // No allocation between acquiring the listener and establishing cleanup.
+  struct ListenGuard {
+    Server &server;
+    ~ListenGuard() {
+      server.close_listener();
+      server.is_running_ = false;
+    }
+  } listen_guard{*this};
 
-  if (start_handler_) { start_handler_(); }
+  std::unique_ptr<TaskQueue> task_queue;
+  const auto ret = serve_guarded([&]() {
+    task_queue.reset(new_task_queue());
+    if (!task_queue) { return false; }
+    if (start_handler_) { start_handler_(); }
 
-  {
-    std::unique_ptr<TaskQueue> task_queue(new_task_queue());
+    using clock = std::chrono::steady_clock;
+    const auto idle_interval = std::chrono::seconds(idle_interval_sec_) +
+                               std::chrono::microseconds(idle_interval_usec_);
+    auto idle_since = clock::now();
 
     while (svr_sock_ != INVALID_SOCKET) {
-#ifndef _WIN32
-      if (idle_interval_sec_ > 0 || idle_interval_usec_ > 0) {
-#endif
-        auto val = detail::select_read(svr_sock_, idle_interval_sec_,
-                                       idle_interval_usec_);
-        if (val == 0) { // Timeout
-          task_queue->on_idle();
-          continue;
-        }
-#ifndef _WIN32
+      auto wait = std::chrono::microseconds(100000);
+      if (idle_interval.count() > 0) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                idle_interval - (clock::now() - idle_since));
+        wait = (std::min)(wait,
+                          (std::max)(std::chrono::microseconds(0), remaining));
       }
-#endif
+      const auto val = detail::select_read(listen_sock, 0,
+                                           static_cast<time_t>(wait.count()));
+      if (svr_sock_ == INVALID_SOCKET) { break; }
+      if (val == 0) {
+        if (idle_interval.count() > 0 &&
+            clock::now() - idle_since >= idle_interval) {
+          task_queue->on_idle();
+          idle_since = clock::now();
+        }
+        continue;
+      }
+      if (val < 0) {
+        output_error_log(Error::Connection, nullptr);
+        return false;
+      }
+      idle_since = clock::now();
 
 #if defined _WIN32
       // sockets connected via WASAccept inherit flags NO_HANDLE_INHERIT,
       // OVERLAPPED
-      socket_t sock = WSAAccept(svr_sock_, nullptr, nullptr, nullptr, 0);
+      socket_t sock = WSAAccept(listen_sock, nullptr, nullptr, nullptr, 0);
 #elif defined SOCK_CLOEXEC
-      socket_t sock = accept4(svr_sock_, nullptr, nullptr, SOCK_CLOEXEC);
+      socket_t sock = accept4(listen_sock, nullptr, nullptr, SOCK_CLOEXEC);
 #else
-      socket_t sock = accept(svr_sock_, nullptr, nullptr);
+      socket_t sock = accept(listen_sock, nullptr, nullptr);
 #endif
 
       if (sock == INVALID_SOCKET) {
@@ -13705,39 +13897,60 @@ inline bool Server::listen_internal() {
         } else if (detail::is_accept_transient_error()) {
           continue;
         }
-        // Take the descriptor out of svr_sock_ before closing it: a later
-        // stop() would otherwise shutdown()/close() a value the OS may have
-        // reused, and keep_alive() watches svr_sock_ to notice the server is
-        // gone. The exchange also settles the race with a concurrent stop(),
-        // since whichever side takes the descriptor closes it exactly once.
-        auto listen_sock = svr_sock_.exchange(INVALID_SOCKET);
-        if (listen_sock != INVALID_SOCKET) {
-          detail::close_socket(listen_sock);
-          ret = false;
+        if (svr_sock_ != INVALID_SOCKET) {
           output_error_log(Error::Connection, nullptr);
-        } else {
-          ; // The server socket was closed by user.
+          return false;
         }
         break;
       }
 
-      detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO,
-                                  read_timeout_sec_, read_timeout_usec_);
-      detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO,
-                                  write_timeout_sec_, write_timeout_usec_);
+      // Acquire final-close ownership immediately, before any allocation or
+      // callback can fail. The task owns cleanup even when an application task
+      // queue discards work without executing it.
+      ServerConnection accepted(sock);
+      if (svr_sock_ == INVALID_SOCKET) { break; }
+      serve_guarded([&]() {
+        auto connection = std::shared_ptr<ServerConnection>(
+            new ServerConnection(accepted.release()));
+        auto task = std::make_shared<ConnectionTask>(connection);
 
-      if (tcp_nodelay_) { set_socket_opt(sock, IPPROTO_TCP, TCP_NODELAY, 1); }
+        // Some systems inherit the listener's nonblocking mode in accept.
+#ifdef _WIN32
+        u_long blocking = 0;
+        if (ioctlsocket(sock, FIONBIO, &blocking)) { return false; }
+#else
+        const auto flags = fcntl(sock, F_GETFL, 0);
+        if (flags == -1 || fcntl(sock, F_SETFL, flags & ~O_NONBLOCK) == -1) {
+          return false;
+        }
+#endif
+        detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO,
+                                    read_timeout_sec_, read_timeout_usec_);
+        detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO,
+                                    write_timeout_sec_, write_timeout_usec_);
+        if (tcp_nodelay_) { set_socket_opt(sock, IPPROTO_TCP, TCP_NODELAY, 1); }
 
-      if (!task_queue->enqueue(
-              [this, sock]() { process_and_close_socket(sock); })) {
-        output_error_log(Error::ResourceExhaustion, nullptr);
-        detail::shutdown_socket(sock);
-        detail::close_socket(sock);
-      }
+        if (connection_handler_) { connection_handler_(connection); }
+        if (connection->is_closed()) { return false; }
+        if (!task_queue->enqueue([this, sock, task]() {
+              if (task->connection->claim()) {
+                serve_guarded([&]() { return process_socket(sock); });
+                task->connection->finish();
+              }
+            })) {
+          output_error_log(Error::ResourceExhaustion, nullptr);
+          return false;
+        }
+        return true;
+      });
     }
+    return true;
+  });
 
-    task_queue->shutdown();
-  }
+  // Close the listener as soon as accept ends, including callback/allocation
+  // failure paths, before joining workers which may still be serving clients.
+  close_listener();
+  if (task_queue) { task_queue->shutdown(); }
 
   is_decommissioned = !ret;
   return ret;
@@ -14445,7 +14658,7 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
 
 inline bool Server::is_valid() const { return !has_invalid_registration_; }
 
-inline bool Server::process_and_close_socket(socket_t sock) {
+inline bool Server::process_socket(socket_t sock) {
   std::string remote_addr;
   int remote_port = 0;
   detail::get_remote_ip_and_port(sock, remote_addr, remote_port);
@@ -14468,7 +14681,7 @@ inline bool Server::process_and_close_socket(socket_t sock) {
         });
   });
 
-  detail::drain_and_close_socket(sock);
+  detail::drain_socket(sock);
   return ret;
 }
 
@@ -17809,7 +18022,7 @@ inline bool SSLServer::is_valid() const {
   return ctx_ != nullptr && Server::is_valid();
 }
 
-inline bool SSLServer::process_and_close_socket(socket_t sock) {
+inline bool SSLServer::process_socket(socket_t sock) {
   using namespace tls;
 
   // Create TLS session with mutex protection
@@ -17821,21 +18034,24 @@ inline bool SSLServer::process_and_close_socket(socket_t sock) {
 
   if (!session) {
     last_ssl_error_ = static_cast<int>(get_error());
-    detail::shutdown_socket(sock);
-    detail::close_socket(sock);
     return false;
   }
 
-  // Use scope_exit to ensure cleanup on all paths (including exceptions)
+  // Stack-only cleanup acquires ownership before any further allocation. A
+  // std::function scope guard can itself allocate after session creation.
   bool handshake_done = false;
   bool ret = false;
   bool websocket_upgraded = false;
-  auto cleanup = detail::scope_exit([&] {
-    if (handshake_done) { shutdown(session, !websocket_upgraded && ret); }
-    free_session(session);
-    detail::shutdown_socket(sock);
-    detail::close_socket(sock);
-  });
+  struct SessionCleanup {
+    session_t session;
+    bool &handshake_done;
+    bool &ret;
+    bool &websocket_upgraded;
+    ~SessionCleanup() {
+      if (handshake_done) { shutdown(session, !websocket_upgraded && ret); }
+      free_session(session);
+    }
+  } cleanup{session, handshake_done, ret, websocket_upgraded};
 
   // Perform TLS accept handshake with timeout
   TlsError tls_err;
