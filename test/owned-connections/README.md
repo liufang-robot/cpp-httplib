@@ -45,6 +45,11 @@ The embedding service owns those policies. Socket interruption cannot stop an
 arbitrary C++ callback. Fresh server instances after all network workers join
 are the intended embedding restart pattern.
 
+For exclusive binding beside another server, set POSIX `SO_REUSEADDR=1` and
+`SO_REUSEPORT=0`. On Windows use `SO_EXCLUSIVEADDRUSE=1` instead: Windows
+`SO_REUSEADDR` permits binding an occupied port and does not give the POSIX
+contract. The lifecycle fixtures check an occupied port is rejected.
+
 Capability macros are `CPPHTTPLIB_SERVER_CONNECTION_SUPPORT`,
 `CPPHTTPLIB_SIGPIPE_POLICY_SUPPORT`, and `CPPHTTPLIB_OWNED_LISTENER_SUPPORT` (1).
 All translation units of a compiled library must use consistent definitions;

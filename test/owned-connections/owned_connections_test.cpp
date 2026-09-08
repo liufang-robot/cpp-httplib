@@ -177,9 +177,13 @@ struct RunningServer {
         server = owned.get();
         check(server->is_valid(), "server TLS configuration");
         server->set_socket_options([](socket_t socket) {
+#ifdef _WIN32
+          httplib::set_socket_opt(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1);
+#else
           httplib::set_socket_opt(socket, SOL_SOCKET, SO_REUSEADDR, 1);
 #ifdef SO_REUSEPORT
           httplib::set_socket_opt(socket, SOL_SOCKET, SO_REUSEPORT, 0);
+#endif
 #endif
         });
         server->set_read_timeout(30);
@@ -457,9 +461,13 @@ void configuration_failures() {
   RunningServer runtime(false);
   httplib::Server conflicting;
   conflicting.set_socket_options([](socket_t socket) {
+#ifdef _WIN32
+    httplib::set_socket_opt(socket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE, 1);
+#else
     httplib::set_socket_opt(socket, SOL_SOCKET, SO_REUSEADDR, 1);
 #ifdef SO_REUSEPORT
     httplib::set_socket_opt(socket, SOL_SOCKET, SO_REUSEPORT, 0);
+#endif
 #endif
   });
   check(!conflicting.bind_to_port("127.0.0.1", runtime.port),
