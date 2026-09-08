@@ -32,6 +32,12 @@ stop without closing a descriptor that another thread still uses. Startup and
 accept-loop callback exceptions clean up the listener and join the task queue.
 An embedding runtime must still keep the server alive until listen returns.
 
+Active worker readiness waits also inspect a connection-owned cancellation
+flag at intervals of at most 100 ms. Native Windows testing found that
+WSAPoll can remain blocked during a stalled TLS handshake after local shutdown.
+The flag avoids relying on that wakeup and applies only to the owned socket;
+a handler's nested client connections are unaffected.
+
 With ownership enabled, the private virtual processor is `process_socket`; it must not close
 the socket. Custom overrides of the old private `process_and_close_socket`
 need updating for an owned build. This is intentional: retaining an override that closes a raw

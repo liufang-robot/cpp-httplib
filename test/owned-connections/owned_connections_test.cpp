@@ -83,6 +83,7 @@ public:
   }
   RawClient(const RawClient &) = delete;
   RawClient &operator=(const RawClient &) = delete;
+  socket_t socket() const { return sock_; }
 
 private:
   socket_t sock_;
@@ -314,6 +315,31 @@ void interrupted(bool tls) {
   check(client.is_disconnected(), "interrupted peer still connected");
 }
 
+void wait_cancellation() {
+  RunningServer runtime(false);
+  RawClient idle(runtime.port);
+  RawClient unrelated(runtime.port);
+  std::atomic<bool> cancelled{false};
+  std::promise<void> entered;
+  auto ready = entered.get_future();
+  auto waiting = std::async(std::launch::async, [&] {
+    httplib::detail::SocketWaitCancellation guard(idle.socket(), cancelled);
+    entered.set_value();
+    const auto result = httplib::detail::select_read(idle.socket(), 30, 0);
+    check(httplib::detail::select_read(unrelated.socket(), 0, 0) == 0,
+          "connection cancellation affected an unrelated socket wait");
+    return result;
+  });
+  ready.get();
+  cancelled.store(true);
+  // No socket shutdown: completion must follow the ownership token even on
+  // a platform whose poll implementation does not wake on local shutdown.
+  check(waiting.wait_for(std::chrono::seconds(2)) == std::future_status::ready,
+        "socket readiness did not observe cancellation");
+  check(waiting.get() < 0, "cancelled readiness wait succeeded");
+  runtime.stop();
+}
+
 void restart(bool tls) {
   std::vector<Connection> old_handles;
   std::vector<std::unique_ptr<httplib::Client>> old_clients;
@@ -539,7 +565,8 @@ void active_response(bool tls, bool broken_peer, bool interrupt) {
 
 void signal_policy() {
 #ifndef _WIN32
-  struct sigaction original{}, probe{}, after{};
+  struct sigaction original {
+  }, probe{}, after{};
   check(sigaction(SIGPIPE, nullptr, &original) == 0,
         "read SIGPIPE disposition");
   probe.sa_handler = SIG_DFL;
@@ -580,6 +607,8 @@ int main(int argc, char **argv) {
       queued(tls, true, false);
     } else if (name.find("interrupted_") == 0) {
       interrupted(tls);
+    } else if (name == "wait_cancellation") {
+      wait_cancellation();
     } else if (name.find("restart_") == 0) {
       restart(tls);
     } else if (name == "hook_exception") {

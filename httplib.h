@@ -1946,6 +1946,7 @@ private:
   mutable std::mutex mutex_;
   socket_t sock_;
   bool active_ = false;
+  std::atomic<bool> cancelled_{false};
 };
 #endif
 
@@ -6390,6 +6391,26 @@ inline int poll_wrapper(struct pollfd *fds, nfds_t nfds, int timeout) {
 #endif
 }
 
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
+// A worker's wait guard borrows its live connection's cancellation flag.
+// It applies only to that descriptor, including TLS handshake/read waits;
+// nested client calls made by a handler retain their own socket behavior.
+struct SocketWaitCancellation {
+  SocketWaitCancellation(socket_t value, const std::atomic<bool> &flag)
+      : sock(value), cancelled(flag), previous(current()) {
+    current() = this;
+  }
+  ~SocketWaitCancellation() { current() = previous; }
+  static SocketWaitCancellation *&current() {
+    static thread_local SocketWaitCancellation *value = nullptr;
+    return value;
+  }
+  socket_t sock;
+  const std::atomic<bool> &cancelled;
+  SocketWaitCancellation *previous;
+};
+#endif
+
 inline ssize_t select_impl(socket_t sock, short events, time_t sec,
                            time_t usec) {
   struct pollfd pfd;
@@ -6399,6 +6420,40 @@ inline ssize_t select_impl(socket_t sock, short events, time_t sec,
 
   auto timeout = static_cast<int>(sec * 1000 + usec / 1000);
 
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
+  const auto *cancellation = SocketWaitCancellation::current();
+  if (cancellation && cancellation->sock == sock) {
+    // WSAPoll is not reliably awakened by shutdown on another thread.
+    // Check the ownership token between bounded waits, without closing a
+    // descriptor while its worker or TLS session still uses it.
+    const auto deadline = std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(timeout < 0 ? 0 : timeout);
+    for (;;) {
+      if (cancellation->cancelled.load(std::memory_order_acquire)) {
+        return -1;
+      }
+      int slice = 100;
+      if (timeout >= 0) {
+        const auto remaining =
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                deadline - std::chrono::steady_clock::now())
+                .count();
+        slice = static_cast<int>((std::max)(
+            int64_t{0},
+            (std::min)(int64_t{100}, static_cast<int64_t>(remaining))));
+      }
+      const auto ready =
+          handle_EINTR([&]() { return poll_wrapper(&pfd, 1, slice); });
+      if (cancellation->cancelled.load(std::memory_order_acquire)) {
+        return -1;
+      }
+      if (ready != 0) { return ready; }
+      if (timeout >= 0 && std::chrono::steady_clock::now() >= deadline) {
+        return 0;
+      }
+    }
+  }
+#endif
   return handle_EINTR([&]() { return poll_wrapper(&pfd, 1, timeout); });
 }
 
@@ -12757,6 +12812,7 @@ inline void ServerConnection::close_locked() noexcept {
 
 inline void ServerConnection::cancel() noexcept {
   std::lock_guard<std::mutex> lock(mutex_);
+  cancelled_.store(true, std::memory_order_release);
   if (sock_ == INVALID_SOCKET) { return; }
   if (active_) {
     detail::shutdown_socket(sock_);
@@ -13978,6 +14034,8 @@ inline bool Server::listen_internal() {
         if (connection->is_closed()) { return false; }
         if (!task_queue->enqueue([this, sock, task]() {
               if (task->connection->claim()) {
+                detail::SocketWaitCancellation wait_guard(
+                    sock, task->connection->cancelled_);
                 serve_guarded([&]() { return process_socket(sock); });
                 task->connection->finish();
               }
