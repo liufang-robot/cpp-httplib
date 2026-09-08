@@ -161,11 +161,12 @@ struct Connections {
 struct RunningServer {
   explicit RunningServer(bool tls, bool controlled = false, bool reject = false,
                          bool throw_hook = false, bool throw_request = false,
-                         httplib::Server::Handler handler = {}) {
+                         httplib::Server::Handler handler = {},
+                         int bind_port = 0) {
     std::promise<int> ready;
     auto result = ready.get_future();
     listener = std::thread([this, tls, controlled, reject, throw_hook,
-                            throw_request, handler, &ready] {
+                            throw_request, handler, bind_port, &ready] {
       try {
         block_sigpipe();
         std::unique_ptr<httplib::Server> owned;
@@ -203,7 +204,11 @@ struct RunningServer {
           }
           response.set_content(request.target, "text/plain");
         });
-        const int bound = server->bind_to_any_port("127.0.0.1");
+        const int bound =
+            bind_port == 0
+                ? server->bind_to_any_port("127.0.0.1")
+                : (server->bind_to_port("127.0.0.1", bind_port) ? bind_port
+                                                                : -1);
         check(bound > 0, "bind server");
         server->new_task_queue = [this, controlled, reject, bound,
                                   &ready]() -> httplib::TaskQueue * {
@@ -311,9 +316,12 @@ void interrupted(bool tls) {
 
 void restart(bool tls) {
   std::vector<Connection> old_handles;
+  std::vector<std::unique_ptr<httplib::Client>> old_clients;
+  int bind_port = 0;
   // Fresh server generations are the intended HTTP-service restart policy.
   for (int round = 0; round < 3; ++round) {
-    RunningServer runtime(tls);
+    RunningServer runtime(tls, false, false, false, false, {}, bind_port);
+    bind_port = runtime.port;
     std::unique_ptr<httplib::Client> client(new httplib::Client(
         std::string(tls ? "https://127.0.0.1:" : "http://127.0.0.1:") +
         std::to_string(runtime.port)));
@@ -331,6 +339,9 @@ void restart(bool tls) {
     check(response && response->status == 200,
           "old cancellation damaged new connection");
     runtime.stop();
+    // An idle browser may retain its half-closed peer socket across restart.
+    // Rebind the same endpoint, without depending on that browser's cleanup.
+    old_clients.push_back(std::move(client));
   }
 }
 
