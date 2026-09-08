@@ -18320,8 +18320,8 @@ inline bool SSLServer::process_and_close_socket(socket_t sock) {
         can_shutdown = ioctlsocket(sock, FIONBIO, &nonblocking) == 0;
 #else
         const auto flags = fcntl(sock, F_GETFL, 0);
-        can_shutdown = flags != -1 &&
-                       fcntl(sock, F_SETFL, flags | O_NONBLOCK) != -1;
+        can_shutdown =
+            flags != -1 && fcntl(sock, F_SETFL, flags | O_NONBLOCK) != -1;
 #endif
       }
 #endif
