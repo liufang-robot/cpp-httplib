@@ -237,8 +237,10 @@ template <typename T> void DigestAuthTestFromHTTPWatch(T &cli) {
 
     cli.set_digest_auth("hello", "world");
     for (auto path : paths) {
+      SCOPED_TRACE("valid origin credentials: " + path);
       auto res = cli.Get(path.c_str());
-      ASSERT_TRUE(res != nullptr);
+      ASSERT_TRUE(res != nullptr)
+          << to_string(res.error()) << ", TLS " << res.ssl_error();
       std::string algo(path.substr(path.rfind('/') + 1));
       EXPECT_EQ(
           normalizeJson("{\"algorithm\":\"" + algo +
@@ -249,15 +251,19 @@ template <typename T> void DigestAuthTestFromHTTPWatch(T &cli) {
 
     cli.set_digest_auth("hello", "bad");
     for (auto path : paths) {
+      SCOPED_TRACE("invalid origin password: " + path);
       auto res = cli.Get(path.c_str());
-      ASSERT_TRUE(res != nullptr);
+      ASSERT_TRUE(res != nullptr)
+          << to_string(res.error()) << ", TLS " << res.ssl_error();
       EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
     }
 
     cli.set_digest_auth("bad", "world");
     for (auto path : paths) {
+      SCOPED_TRACE("invalid origin username: " + path);
       auto res = cli.Get(path.c_str());
-      ASSERT_TRUE(res != nullptr);
+      ASSERT_TRUE(res != nullptr)
+          << to_string(res.error()) << ", TLS " << res.ssl_error();
       EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
     }
   }
