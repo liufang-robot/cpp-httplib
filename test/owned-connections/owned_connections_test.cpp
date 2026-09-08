@@ -24,6 +24,9 @@
 #if CPPHTTPLIB_OWNED_LISTENER_SUPPORT != 1
 #error The HTTP service requires owned listener cleanup
 #endif
+#if CPPHTTPLIB_RAW_ROUTING_SUPPORT != 1
+#error Raw routing requires exact targets and valid extension method admission
+#endif
 
 namespace {
 using Clock = std::chrono::steady_clock;
@@ -205,6 +208,15 @@ struct RunningServer {
           }
           response.set_content(request.target, "text/plain");
         });
+        server->set_pre_routing_handler([](const httplib::Request &request,
+                                          httplib::Response &response) {
+          if (request.method == "FROB") {
+            response.status = 405;
+            response.set_header("Allow", "GET, HEAD, OPTIONS");
+            return httplib::Server::HandlerResponse::Handled;
+          }
+          return httplib::Server::HandlerResponse::Unhandled;
+        });
         const int bound =
             bind_port == 0
                 ? server->bind_to_any_port("127.0.0.1")
@@ -377,13 +389,19 @@ void raw_target() {
        {"/health?name=motion%2Fraw%252F", "/api/services/motion%2Fraw",
         "/api/services/motion%252Fraw", "/api/services/%E6%9C%BA%E5%99%A8",
         "/api/services/a+b", "/api/services/%2e", "/api/services/..",
-        "/api/services//properties"}) {
+        "/api/services//properties", "/api/services/value#fragment"}) {
     RawClient client(runtime.port);
     client.send(std::string("GET ") + target +
                 " HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     check(client.receive().find(target) != std::string::npos,
           "raw request target changed");
   }
+  RawClient extension(runtime.port);
+  extension.send("FROB /health HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+  const auto response = extension.receive();
+  check(response.find("405 Method Not Allowed") != std::string::npos &&
+            response.find("Allow: GET, HEAD, OPTIONS") != std::string::npos,
+        "valid extension method did not reach resource policy");
   runtime.stop();
 }
 

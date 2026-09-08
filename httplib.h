@@ -1918,6 +1918,7 @@ protected:
 #define CPPHTTPLIB_SERVER_CONNECTION_SUPPORT 1
 #define CPPHTTPLIB_SIGPIPE_POLICY_SUPPORT 1
 #define CPPHTTPLIB_OWNED_LISTENER_SUPPORT 1
+#define CPPHTTPLIB_RAW_ROUTING_SUPPORT 1
 
 #ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
 class ServerConnection {
@@ -13313,6 +13314,14 @@ inline bool Server::parse_request_line(const char *s, Request &req) const {
     if (count != 3) { return false; }
   }
 
+#ifdef CPPHTTPLIB_SERVER_RAW_ROUTING
+  // Application pre-routing may resolve extension methods against a resource
+  // and return its own Allow/405 response. Invalid method tokens still fail.
+  if (!detail::fields::is_token(req.method)) {
+    output_error_log(Error::InvalidHTTPMethod, &req);
+    return false;
+  }
+#else
   // A method outside the built-in set is accepted only when a handler has been
   // registered for it with CustomRoute().
   const auto &methods = builtin_methods();
@@ -13322,6 +13331,7 @@ inline bool Server::parse_request_line(const char *s, Request &req) const {
     output_error_log(Error::InvalidHTTPMethod, &req);
     return false;
   }
+#endif
 
   if (req.version != "HTTP/1.1" && req.version != "HTTP/1.0") {
     output_error_log(Error::InvalidHTTPVersion, &req);
@@ -13329,13 +13339,16 @@ inline bool Server::parse_request_line(const char *s, Request &req) const {
   }
 
   {
-    // Skip URL fragment
+#ifndef CPPHTTPLIB_SERVER_RAW_ROUTING
+    // Skip URL fragment. Raw routing leaves the exact target available so an
+    // application can reject invalid targets rather than address another URI.
     for (size_t i = 0; i < req.target.size(); i++) {
       if (req.target[i] == '#') {
         req.target.erase(i);
         break;
       }
     }
+#endif
 
     detail::divide(req.target, '?',
                    [&](const char *lhs_data, std::size_t lhs_size,

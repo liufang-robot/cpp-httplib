@@ -21,7 +21,7 @@ target_compile_features(owned_connections_test PRIVATE cxx_std_11)
 target_include_directories(owned_connections_test PRIVATE ../..)
 target_compile_definitions(owned_connections_test PRIVATE
   CPPHTTPLIB_OPENSSL_SUPPORT CPPHTTPLIB_NO_DEFAULT_SIGPIPE
-  CPPHTTPLIB_OWNED_SERVER_SOCKETS)
+  CPPHTTPLIB_OWNED_SERVER_SOCKETS CPPHTTPLIB_SERVER_RAW_ROUTING)
 target_link_libraries(owned_connections_test PRIVATE
   Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
 if(WIN32)
