@@ -4,6 +4,12 @@ This patch starts from upstream v0.54.1
 (`9d6a7ee2c1aaeb1fd9ae15d14f06f487149d147f`). It provides explicit connection
 ownership for embedding an HTTP server beside other runtimes in one process.
 
+Define `CPPHTTPLIB_OWNED_SERVER_SOCKETS` to enable the connection hooks and
+owned listener. It changes `Server`'s private layout and virtual processor;
+all translation units using these server objects must enable the same option.
+Without it, ordinary builds retain the upstream Server ABI and listener path.
+The Orocos HTTP build enables it automatically and consumes the header privately.
+
 `CPPHTTPLIB_NO_DEFAULT_SIGPIPE` disables the server constructor's process-wide
 SIGPIPE change. The default remains unchanged. On POSIX the embedding runtime
 must block SIGPIPE on its listener thread before construction, let its workers
@@ -26,9 +32,9 @@ stop without closing a descriptor that another thread still uses. Startup and
 accept-loop callback exceptions clean up the listener and join the task queue.
 An embedding runtime must still keep the server alive until listen returns.
 
-The private virtual socket processor is now `process_socket`; it must not close
+With ownership enabled, the private virtual processor is `process_socket`; it must not close
 the socket. Custom overrides of the old private `process_and_close_socket`
-need updating. This is intentional: retaining an override that closes a raw
+need updating for an owned build. This is intentional: retaining an override that closes a raw
 descriptor would invalidate the ownership guarantee. Public handlers and client
 APIs are unchanged. Custom task queues must finish/join all executing work in
 `shutdown()` and must not throw from that cleanup.

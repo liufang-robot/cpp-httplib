@@ -2231,12 +2231,14 @@ public:
   Server &set_ipv6_v6only(bool on);
   Server &set_socket_options(SocketOptions socket_options);
 
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
   // Set before listening. Called on the listener thread before enqueue, for
   // both HTTP and HTTPS, including connections later rejected by the queue.
   // Retaining the handle does not keep a completed socket open. An exception
   // closes this connection and is contained at the listener boundary.
   Server &set_connection_handler(
       std::function<void(std::shared_ptr<ServerConnection>)> handler);
+#endif
 
   Server &set_default_headers(Headers headers);
   Server &
@@ -2385,12 +2387,14 @@ private:
                                 SocketOptions socket_options) const;
   int bind_internal(const std::string &host, int port, int socket_flags);
   bool listen_internal();
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
   void close_listener() noexcept;
 
   std::mutex listener_mutex_;
   std::unique_ptr<ServerConnection> listener_connection_;
   bool binding_ = false;
   bool bind_cancelled_ = false;
+#endif
 
   bool routing(Request &req, Response &res, Stream &strm);
   bool handle_file_request(Request &req, Response &res);
@@ -2432,6 +2436,7 @@ private:
                          FormDataHeader multipart_header,
                          ContentReceiver multipart_receiver) const;
 
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
   virtual bool process_socket(socket_t sock);
 
   struct ConnectionTask {
@@ -2442,6 +2447,9 @@ private:
   };
 
   std::function<void(std::shared_ptr<ServerConnection>)> connection_handler_;
+#else
+  virtual bool process_and_close_socket(socket_t sock);
+#endif
 
   void output_log(const Request &req, const Response &res) const;
   void output_pre_compression_log(const Request &req,
@@ -3336,12 +3344,21 @@ public:
   int ssl_last_error() const { return last_ssl_error_; }
 
 private:
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
   bool process_socket(socket_t sock) override;
+#else
+  bool process_and_close_socket(socket_t sock) override;
+#endif
 
   tls::ctx_t ctx_ = nullptr;
   std::mutex ctx_mutex_;
 
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
+  // Independent TLS workers may fail simultaneously.
+  std::atomic<int> last_ssl_error_{0};
+#else
   int last_ssl_error_ = 0;
+#endif
 };
 
 class SSLClient final : public ClientImpl {
@@ -13049,11 +13066,13 @@ inline Server &Server::set_socket_options(SocketOptions socket_options) {
   return *this;
 }
 
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
 inline Server &Server::set_connection_handler(
     std::function<void(std::shared_ptr<ServerConnection>)> handler) {
   connection_handler_ = std::move(handler);
   return *this;
 }
+#endif
 
 inline Server &Server::set_default_headers(Headers headers) {
   default_headers_ = std::move(headers);
@@ -13175,6 +13194,7 @@ inline void Server::wait_until_ready() const {
   }
 }
 
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
 inline void Server::stop() noexcept {
   std::lock_guard<std::mutex> lock(listener_mutex_);
   if (binding_) { bind_cancelled_ = true; }
@@ -13190,6 +13210,19 @@ inline void Server::close_listener() noexcept {
   svr_sock_ = INVALID_SOCKET;
   listener_connection_.reset();
 }
+#else
+inline void Server::stop() noexcept {
+  // Release the listening socket whether or not the accept loop is running:
+  // bind_to_port() without listen_after_bind() still owns the descriptor. The
+  // exchange is what makes this safe to call concurrently with the accept loop.
+  socket_t sock = svr_sock_.exchange(INVALID_SOCKET);
+  if (sock != INVALID_SOCKET) {
+    detail::shutdown_socket(sock);
+    detail::close_socket(sock);
+  }
+  is_decommissioned = false;
+}
+#endif
 
 inline void Server::decommission() { is_decommissioned = true; }
 
@@ -13745,6 +13778,7 @@ Server::create_server_socket(const std::string &host, int port,
       });
 }
 
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
 inline int Server::bind_internal(const std::string &host, int port,
                                  int socket_flags) {
   {
@@ -13955,6 +13989,131 @@ inline bool Server::listen_internal() {
   is_decommissioned = !ret;
   return ret;
 }
+#else
+inline int Server::bind_internal(const std::string &host, int port,
+                                 int socket_flags) {
+  if (is_decommissioned) { return -1; }
+
+  if (!is_valid()) { return -1; }
+
+  svr_sock_ = create_server_socket(host, port, socket_flags, socket_options_);
+  if (svr_sock_ == INVALID_SOCKET) { return -1; }
+
+  if (port == 0) {
+    struct sockaddr_storage addr;
+    socklen_t addr_len = sizeof(addr);
+    if (getsockname(svr_sock_, reinterpret_cast<struct sockaddr *>(&addr),
+                    &addr_len) == -1) {
+      output_error_log(Error::GetSockName, nullptr);
+      return -1;
+    }
+    if (addr.ss_family == AF_INET) {
+      return ntohs(reinterpret_cast<struct sockaddr_in *>(&addr)->sin_port);
+    } else if (addr.ss_family == AF_INET6) {
+      return ntohs(reinterpret_cast<struct sockaddr_in6 *>(&addr)->sin6_port);
+    } else {
+      output_error_log(Error::UnsupportedAddressFamily, nullptr);
+      return -1;
+    }
+  } else {
+    return port;
+  }
+}
+
+inline bool Server::listen_internal() {
+  // A stop() between bind and listen leaves nothing to accept on. Report
+  // failure instead of returning success without ever serving, and mark the
+  // server decommissioned the way any failed listen does so that a concurrent
+  // wait_until_ready() wakes up instead of spinning forever.
+  if (is_decommissioned || svr_sock_ == INVALID_SOCKET) {
+    is_decommissioned = true;
+    return false;
+  }
+
+  auto ret = true;
+  is_running_ = true;
+  auto se = detail::scope_exit([&]() { is_running_ = false; });
+
+  if (start_handler_) { start_handler_(); }
+
+  {
+    std::unique_ptr<TaskQueue> task_queue(new_task_queue());
+
+    while (svr_sock_ != INVALID_SOCKET) {
+#ifndef _WIN32
+      if (idle_interval_sec_ > 0 || idle_interval_usec_ > 0) {
+#endif
+        auto val = detail::select_read(svr_sock_, idle_interval_sec_,
+                                       idle_interval_usec_);
+        if (val == 0) { // Timeout
+          task_queue->on_idle();
+          continue;
+        }
+#ifndef _WIN32
+      }
+#endif
+
+#if defined _WIN32
+      // sockets connected via WASAccept inherit flags NO_HANDLE_INHERIT,
+      // OVERLAPPED
+      socket_t sock = WSAAccept(svr_sock_, nullptr, nullptr, nullptr, 0);
+#elif defined SOCK_CLOEXEC
+      socket_t sock = accept4(svr_sock_, nullptr, nullptr, SOCK_CLOEXEC);
+#else
+      socket_t sock = accept(svr_sock_, nullptr, nullptr);
+#endif
+
+      if (sock == INVALID_SOCKET) {
+        // NOTE: Winsock reports failures through WSAGetLastError() and never
+        // touches the CRT errno, so the two have to be asked platform by
+        // platform rather than by testing errno here.
+        if (detail::is_accept_resource_error()) {
+          // The per-process descriptor limit or the network stack's buffer
+          // space has been reached. Try to accept new connections after a
+          // short sleep.
+          std::this_thread::sleep_for(std::chrono::microseconds{1});
+          continue;
+        } else if (detail::is_accept_transient_error()) {
+          continue;
+        }
+        // Take the descriptor out of svr_sock_ before closing it: a later
+        // stop() would otherwise shutdown()/close() a value the OS may have
+        // reused, and keep_alive() watches svr_sock_ to notice the server is
+        // gone. The exchange also settles the race with a concurrent stop(),
+        // since whichever side takes the descriptor closes it exactly once.
+        auto listen_sock = svr_sock_.exchange(INVALID_SOCKET);
+        if (listen_sock != INVALID_SOCKET) {
+          detail::close_socket(listen_sock);
+          ret = false;
+          output_error_log(Error::Connection, nullptr);
+        } else {
+          ; // The server socket was closed by user.
+        }
+        break;
+      }
+
+      detail::set_socket_opt_time(sock, SOL_SOCKET, SO_RCVTIMEO,
+                                  read_timeout_sec_, read_timeout_usec_);
+      detail::set_socket_opt_time(sock, SOL_SOCKET, SO_SNDTIMEO,
+                                  write_timeout_sec_, write_timeout_usec_);
+
+      if (tcp_nodelay_) { set_socket_opt(sock, IPPROTO_TCP, TCP_NODELAY, 1); }
+
+      if (!task_queue->enqueue(
+              [this, sock]() { process_and_close_socket(sock); })) {
+        output_error_log(Error::ResourceExhaustion, nullptr);
+        detail::shutdown_socket(sock);
+        detail::close_socket(sock);
+      }
+    }
+
+    task_queue->shutdown();
+  }
+
+  is_decommissioned = !ret;
+  return ret;
+}
+#endif
 
 inline bool Server::routing(Request &req, Response &res, Stream &strm) {
   if (pre_routing_handler_ &&
@@ -14658,7 +14817,11 @@ Server::process_request(Stream &strm, const std::string &remote_addr,
 
 inline bool Server::is_valid() const { return !has_invalid_registration_; }
 
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
 inline bool Server::process_socket(socket_t sock) {
+#else
+inline bool Server::process_and_close_socket(socket_t sock) {
+#endif
   std::string remote_addr;
   int remote_port = 0;
   detail::get_remote_ip_and_port(sock, remote_addr, remote_port);
@@ -14681,7 +14844,11 @@ inline bool Server::process_socket(socket_t sock) {
         });
   });
 
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
   detail::drain_socket(sock);
+#else
+  detail::drain_and_close_socket(sock);
+#endif
   return ret;
 }
 
@@ -18022,7 +18189,18 @@ inline bool SSLServer::is_valid() const {
   return ctx_ != nullptr && Server::is_valid();
 }
 
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
 inline bool SSLServer::process_socket(socket_t sock) {
+#else
+inline bool SSLServer::process_and_close_socket(socket_t sock) {
+  struct SocketCleanup {
+    socket_t sock;
+    ~SocketCleanup() {
+      detail::shutdown_socket(sock);
+      detail::close_socket(sock);
+    }
+  } socket_cleanup{sock};
+#endif
   using namespace tls;
 
   // Create TLS session with mutex protection

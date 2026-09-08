@@ -20,7 +20,8 @@ add_executable(owned_connections_test owned_connections_test.cpp)
 target_compile_features(owned_connections_test PRIVATE cxx_std_11)
 target_include_directories(owned_connections_test PRIVATE ../..)
 target_compile_definitions(owned_connections_test PRIVATE
-  CPPHTTPLIB_OPENSSL_SUPPORT CPPHTTPLIB_NO_DEFAULT_SIGPIPE)
+  CPPHTTPLIB_OPENSSL_SUPPORT CPPHTTPLIB_NO_DEFAULT_SIGPIPE
+  CPPHTTPLIB_OWNED_SERVER_SOCKETS)
 target_link_libraries(owned_connections_test PRIVATE
   Threads::Threads OpenSSL::SSL OpenSSL::Crypto)
 if(WIN32)
@@ -56,7 +57,8 @@ foreach(mode IN ITEMS default_http noexceptions_tls)
   set_tests_properties(${mode}_policy PROPERTIES TIMEOUT 15)
 endforeach()
 target_compile_definitions(noexceptions_tls_policy PRIVATE
-  CPPHTTPLIB_OPENSSL_SUPPORT CPPHTTPLIB_NO_EXCEPTIONS)
+  CPPHTTPLIB_OPENSSL_SUPPORT CPPHTTPLIB_NO_EXCEPTIONS
+  CPPHTTPLIB_OWNED_SERVER_SOCKETS)
 target_link_libraries(noexceptions_tls_policy PRIVATE OpenSSL::SSL OpenSSL::Crypto)
 if(MSVC)
   target_compile_options(noexceptions_tls_policy PRIVATE /EHs-c-)

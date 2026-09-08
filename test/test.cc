@@ -4733,7 +4733,7 @@ TEST(ServerExceptionTest, ThrowingWebSocketHandlerDoesNotKillTheServer) {
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
 TEST(ServerExceptionTest, ThrowingContentProviderDoesNotKillTheSSLServer) {
-  // SSLServer::process_socket() is a separate overload with its own
+  // SSLServer::process_and_close_socket() is a separate overload with its own
   // guard, so it is exercised on its own.
   SSLServer svr(SERVER_CERT_FILE, SERVER_PRIVATE_KEY_FILE);
   ASSERT_TRUE(svr.is_valid());
@@ -13983,7 +13983,11 @@ TEST(SSLClientServerTest, SSLConnectTimeout) {
     std::atomic_bool stop_;
 
   private:
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
     bool process_socket(socket_t /*sock*/) override {
+#else
+    bool process_and_close_socket(socket_t /*sock*/) override {
+#endif
       // Don't create SSL context
       while (!stop_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
