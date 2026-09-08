@@ -69,6 +69,11 @@ class Origin(BaseHTTPRequestHandler):
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         self.send_header("Cache-Control", "no-store")
+        if self.close_connection:
+            # BaseHTTPRequestHandler honors a client's Connection: close but
+            # does not advertise it in the response. A Digest retry must know
+            # to establish a fresh TLS connection before resending credentials.
+            self.send_header("Connection", "close")
         if challenge:
             self.send_header("WWW-Authenticate", challenge)
         self.end_headers()
