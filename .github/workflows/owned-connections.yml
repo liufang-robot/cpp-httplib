@@ -1,0 +1,47 @@
+name: Owned server connections
+
+on:
+  pull_request:
+  push:
+    branches: [rtt-maintenance]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: owned-connections-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  linux:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install test dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libssl-dev
+      - name: Configure
+        run: cmake -S test/owned-connections -B build-owned -G Ninja -DCMAKE_BUILD_TYPE=Debug
+      - name: Build
+        run: cmake --build build-owned --parallel 2
+      - name: Verify ownership and compatibility
+        run: ctest --test-dir build-owned --output-on-failure --parallel 2
+
+  windows:
+    runs-on: windows-2022
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install OpenSSL
+        shell: pwsh
+        run: |
+          & "$env:VCPKG_INSTALLATION_ROOT/vcpkg.exe" install openssl:x64-windows
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S test/owned-connections -B build-owned -A x64 `
+            -DCMAKE_TOOLCHAIN_FILE="$env:VCPKG_INSTALLATION_ROOT/scripts/buildsystems/vcpkg.cmake"
+      - name: Build
+        run: cmake --build build-owned --config Debug --parallel 2
+      - name: Verify ownership and compatibility
+        run: ctest --test-dir build-owned -C Debug --output-on-failure --parallel 2

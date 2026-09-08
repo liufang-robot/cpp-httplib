@@ -114,6 +114,13 @@ test_wolfssl_parallel : test_wolfssl
 test_no_tls_parallel : test_no_tls
 	$(call run_parallel,test_no_tls)
 
+proxy-origin-cert.pem:
+	openssl req -x509 -newkey rsa:2048 -nodes -days 2 \
+	  -keyout proxy-origin-key.pem -out proxy-origin-cert.pem \
+	  -subj /CN=origin -addext subjectAltName=DNS:origin
+
+proxy proxy_mbedtls proxy_wolfssl : proxy-origin-cert.pem
+
 proxy : test_proxy
 	@echo "Starting proxy server..."
 	cd proxy && \
@@ -322,4 +329,3 @@ cert.pem:
 
 clean:
 	rm -rf test test_split test_mbedtls test_split_mbedtls test_wolfssl test_split_wolfssl test_no_tls, test_split_no_tls test_proxy test_proxy_mbedtls test_proxy_wolfssl test_benchmark server_fuzzer client_fuzzer header_parser_fuzzer url_parser_fuzzer *.pem *.0 *.o *.1 *.srl httplib.h httplib.cc _build* *.dSYM *_shard_*.log cpp-httplib
-

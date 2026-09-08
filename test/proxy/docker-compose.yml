@@ -1,4 +1,17 @@
 services:
+  origin:
+    image: python:3.12-slim
+    command: ["python3", "/app/origin.py"]
+    volumes:
+      - ./origin.py:/app/origin.py:ro
+      - ../proxy-origin-cert.pem:/app/cert.pem:ro
+      - ../proxy-origin-key.pem:/app/key.pem:ro
+    healthcheck:
+      test: ["CMD", "python3", "-c", "import socket; socket.create_connection(('127.0.0.1', 80), 1).close()"]
+      interval: 1s
+      timeout: 2s
+      retries: 10
+
   squid_basic:
     image: squid_basic
     restart: always
@@ -8,6 +21,9 @@ services:
       context: ./
       args:
         auth: basic
+    depends_on:
+      origin:
+        condition: service_healthy
 
   squid_digest:
     image: squid_digest
@@ -18,3 +34,6 @@ services:
       context: ./
       args:
         auth: digest
+    depends_on:
+      origin:
+        condition: service_healthy

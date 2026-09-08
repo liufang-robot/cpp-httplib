@@ -203,13 +203,14 @@ template <typename T> void BaseAuthTestFromHTTPWatch(T &cli) {
 }
 
 TEST(BaseAuthTest, NoSSL) {
-  Client cli("httpcan.org");
+  Client cli("origin");
   BaseAuthTestFromHTTPWatch(cli);
 }
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
 TEST(BaseAuthTest, SSL) {
-  SSLClient cli("httpcan.org");
+  SSLClient cli("origin");
+  cli.set_ca_cert_path("proxy-origin-cert.pem");
   BaseAuthTestFromHTTPWatch(cli);
 }
 #endif
@@ -236,8 +237,10 @@ template <typename T> void DigestAuthTestFromHTTPWatch(T &cli) {
 
     cli.set_digest_auth("hello", "world");
     for (auto path : paths) {
+      SCOPED_TRACE("valid origin credentials: " + path);
       auto res = cli.Get(path.c_str());
-      ASSERT_TRUE(res != nullptr);
+      ASSERT_TRUE(res != nullptr)
+          << to_string(res.error()) << ", TLS " << res.ssl_error();
       std::string algo(path.substr(path.rfind('/') + 1));
       EXPECT_EQ(
           normalizeJson("{\"algorithm\":\"" + algo +
@@ -248,27 +251,32 @@ template <typename T> void DigestAuthTestFromHTTPWatch(T &cli) {
 
     cli.set_digest_auth("hello", "bad");
     for (auto path : paths) {
+      SCOPED_TRACE("invalid origin password: " + path);
       auto res = cli.Get(path.c_str());
-      ASSERT_TRUE(res != nullptr);
+      ASSERT_TRUE(res != nullptr)
+          << to_string(res.error()) << ", TLS " << res.ssl_error();
       EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
     }
 
     cli.set_digest_auth("bad", "world");
     for (auto path : paths) {
+      SCOPED_TRACE("invalid origin username: " + path);
       auto res = cli.Get(path.c_str());
-      ASSERT_TRUE(res != nullptr);
+      ASSERT_TRUE(res != nullptr)
+          << to_string(res.error()) << ", TLS " << res.ssl_error();
       EXPECT_EQ(StatusCode::Unauthorized_401, res->status);
     }
   }
 }
 
 TEST(DigestAuthTest, SSL) {
-  SSLClient cli("httpcan.org");
+  SSLClient cli("origin");
+  cli.set_ca_cert_path("proxy-origin-cert.pem");
   DigestAuthTestFromHTTPWatch(cli);
 }
 
 TEST(DigestAuthTest, NoSSL) {
-  Client cli("httpcan.org");
+  Client cli("origin");
   DigestAuthTestFromHTTPWatch(cli);
 }
 #endif

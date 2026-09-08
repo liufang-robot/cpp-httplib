@@ -13983,7 +13983,14 @@ TEST(SSLClientServerTest, SSLConnectTimeout) {
     std::atomic_bool stop_;
 
   private:
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
+    bool process_socket(socket_t /*sock*/) override { return wait_for_stop(); }
+#else
     bool process_and_close_socket(socket_t /*sock*/) override {
+      return wait_for_stop();
+    }
+#endif
+    bool wait_for_stop() {
       // Don't create SSL context
       while (!stop_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
