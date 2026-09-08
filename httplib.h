@@ -1919,6 +1919,7 @@ protected:
 #define CPPHTTPLIB_SIGPIPE_POLICY_SUPPORT 1
 #define CPPHTTPLIB_OWNED_LISTENER_SUPPORT 1
 
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
 class ServerConnection {
 public:
   ~ServerConnection();
@@ -1946,6 +1947,7 @@ private:
   socket_t sock_;
   bool active_ = false;
 };
+#endif
 
 class TaskQueue {
 public:
@@ -6587,7 +6589,11 @@ inline int shutdown_socket(socket_t sock) noexcept {
 // (or bytes arriving after the receive side is closed) makes the stack send
 // an abortive RST instead of a graceful FIN, which can make the peer see the
 // response as a failed read even though it was fully written.
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
 inline void drain_socket(socket_t sock) noexcept {
+#else
+inline void drain_and_close_socket(socket_t sock) noexcept {
+#endif
 #ifdef _WIN32
   shutdown(sock, SD_SEND);
 #else
@@ -6610,10 +6616,12 @@ inline void drain_socket(socket_t sock) noexcept {
     if (n <= 0) { break; }
     total += static_cast<size_t>(n);
   }
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
 }
 
 inline void drain_and_close_socket(socket_t sock) noexcept {
   drain_socket(sock);
+#endif
   shutdown_socket(sock);
   close_socket(sock);
 }
@@ -12736,6 +12744,7 @@ inline void WebSocketSSLStream::set_read_timeout(time_t sec, time_t usec) {
  */
 
 // HTTP server implementation
+#ifdef CPPHTTPLIB_OWNED_SERVER_SOCKETS
 inline ServerConnection::~ServerConnection() { finish(); }
 
 inline void ServerConnection::close_locked() noexcept {
@@ -12783,6 +12792,7 @@ inline void ServerConnection::finish() noexcept {
   std::lock_guard<std::mutex> lock(mutex_);
   close_locked();
 }
+#endif
 
 inline Server::Server()
     : new_task_queue([] {
