@@ -203,13 +203,14 @@ template <typename T> void BaseAuthTestFromHTTPWatch(T &cli) {
 }
 
 TEST(BaseAuthTest, NoSSL) {
-  Client cli("httpcan.org");
+  Client cli("origin");
   BaseAuthTestFromHTTPWatch(cli);
 }
 
 #ifdef CPPHTTPLIB_SSL_ENABLED
 TEST(BaseAuthTest, SSL) {
-  SSLClient cli("httpcan.org");
+  SSLClient cli("origin");
+  cli.set_ca_cert_path("proxy-origin-cert.pem");
   BaseAuthTestFromHTTPWatch(cli);
 }
 #endif
@@ -263,12 +264,13 @@ template <typename T> void DigestAuthTestFromHTTPWatch(T &cli) {
 }
 
 TEST(DigestAuthTest, SSL) {
-  SSLClient cli("httpcan.org");
+  SSLClient cli("origin");
+  cli.set_ca_cert_path("proxy-origin-cert.pem");
   DigestAuthTestFromHTTPWatch(cli);
 }
 
 TEST(DigestAuthTest, NoSSL) {
-  Client cli("httpcan.org");
+  Client cli("origin");
   DigestAuthTestFromHTTPWatch(cli);
 }
 #endif
